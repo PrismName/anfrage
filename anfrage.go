@@ -1,139 +1,192 @@
 package anfrage
 
 import (
-	"golang.org/net/x/publicsuffix"
-	"log"
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
+	"io"
+	"io/ioutil"
+	"strings"
+	"golang.org/x/net/html/charset"
 )
 
 const (
-	GET    = "GET"
-	POST   = "POST"
-	PUT    = "PUT"
-	DELETE = "DELETE"
+	GET  = "GET"
+	POST = "POST"
+	PUT  = "PUT"
+
+	CreateRequestObjectException      = 10010
+	GetResponseContentException       = 10011
+	ReaderResponseContentException    = 10012
+	PostDataJsonMarshalException      = 10013
+	CreatePostRequestOjectException   = 10014
+	SendPostRequestException          = 10015
+	GetPostResponseContentException   = 10016
+	CreatePutRequestObjectException   = 10017
+	GetPutResponseCotnentException    = 10018
+	ReaderPutResponseContentException = 10019
 )
 
-type Response *http.Response
+var (
+	defaultClient = &http.Client{}
+	Headers       = make(map[string]string)
+	Cookies       = make(map[string]string)
+)
 
-type Request *http.Request
+type ErrorType int
 
-type Anfrage struct {
-	Url       string
-	Method    string
-	Data      map[string]interface{}
-	FormData  url.Values
-	QueryData url.Values
-	Headers   http.Header
-	Cookies   []*http.Cookie
-	UserAgent string
-	BasicAuth struct{ Username, Password string }
-	Proxy     func(proxyUrl string) (string, error)
-	IsClear   bool
+type Error struct {
+	TypeError ErrorType
+	msg       string
 }
 
-func (a *Anfrage) NewAnfrage() {
-	cookieJarOptions := cookiejar.Options{
-		PublicSuffixList: publicsuffix.List,
+func (e Error)Error() string {
+	return e.msg
+}
+
+func newError(t ErrorType, msg string) Error {
+	return Error{TypeError: t, msg: msg}
+}
+
+func setHeader(key, value string) {
+	Headers[key] = value
+}
+
+func setHttpHeaderAndCookie(request *http.Request) {
+	for k, v := range Headers {
+		request.Header.Set(k, v)
 	}
 
-	jar, _ := cookiejar.New(&cookieJarOptions)
-
-	a := &Anfrage{
-		Data:      make(map[string]interface{}),
-		FormData:  http.Values{},
-		QueryData: http.Values{},
-		Headers:   http.Header{},
-		Cookies:   make([]*http.Cookie, 0),
-		UserAgent: "",
-		BasicAuth: struct{ Username, Password string }{},
-	}
-
-	return a
-}
-
-func (a *Anfrage) ClearAnfrage() {
-	if a.IsClear {
-		return
-	}
-	a.Url = ""
-	a.Method = ""
-	a.Headers = http.Header{}
-	a.Data = make(map[string]interface{})
-	a.FormData = http.Values{}
-	a.QueryData = http.Values{}
-	a.Cookies = make([]*http.Cookie, 0)
-	a.UserAgent = ""
-}
-
-func (a *Anfrage) Get(rawUrl string) *Anfrage {
-	a.ClearAnfrage()
-	a.Method = GET
-	a.Url = rawUrl
-	return a
-}
-
-func (a *Anfrage) Post(rawUrl string) *Anfrage {
-	a.ClearAnfrage()
-	a.Method = POST
-	a.Url = rawUrl
-	return a
-}
-
-func (a *Anfrage) Delete(rawUrl string) *Anfrage {
-	a.ClearAnfrage()
-	a.Method = DELETE
-	a.Url = rawUrl
-	return a
-}
-
-func (a *Anfrage) Put(rawUrl string) *Anfrage {
-	a.ClearAnfrage()
-	a.Method = PUT
-	a.Url = rawUrl
-	return a
-}
-
-func (a *Anfrage) UrlOpen(method, rawUrl string) *Anfrage {
-	switch method {
-	case GET:
-		return a.Get(rawUrl)
-	case POST:
-		return a.Post(rawUrl)
-	case PUT:
-		return a.Put(rawUrl)
-	case DELETE:
-		return a.Delete(rawUrl)
-	default:
-		a.Method = method
-		a.Url = rawUrl
-		return a
+	for k, v := range Cookies {
+		request.AddCookie(&http.Cookie{
+			Name: k,
+			Value: v,
+		})
 	}
 }
 
-func (a *Anfrage) SetHeaders(key, value string) *Anfrage {
-	a.Headers.Add(key, value)
-	return a
-}
+func getWithClient(target string, client *http.Client) (string, error) {
+	request, err := http.NewRequest(GET, target, nil)
+	if err != nil {
+		return "", newError(CreateRequestObjectException, "create request object exception : " + target)
+	}
 
-func (a *Anfrage) SetBasicAuth(username, password string) *Anfrage {
-	a.BasicAuth = struct{ Username, Password string }{username, password}
-	return a
-}
+	setHttpHeaderAndCookie(request)
 
-func (a *Anfrage) SetCookie(c *http.Cookie) *Anfrage {
-	s.Cookies = append(s.Cookies, c)
-	return a
-}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", newError(GetResponseContentException, "Can't Get response body exception : " + target)
+	}
 
-func (a *Anfrage) SetProxies(proxyUrl string) *Anfrage {
-	proxiesUrl, err := url.Parse(proxyUrl)
+	defer response.Body.Close()
+
+	utf8Reader, err := charset.NewReader(response.Body, response.Header.Get("Content-Type"))
+	if err != nil {
+		return "", err
+	}
+
+	content, err := ioutil.ReadAll(utf8Reader)
 
 	if err != nil {
-		log.Fatal("Can't parser proxy url : ", err)
+		return "", newError(ReaderResponseContentException, "Can't to read the response body")
+	}
+	return string(content), nil
+}
+
+func getBody(rawContent interface{}) (io.Reader, error) {
+	var bodyReader io.Reader
+
+	if rawContent != nil {
+		switch body := rawContent.(type) {
+		case map[string]string:
+			jsonBody, err := json.Marshal(body)
+			if err != nil {
+				return nil, newError(PostDataJsonMarshalException, "Can't serialize map of string to json")
+			}
+			bodyReader = bytes.NewBuffer(jsonBody)
+		case url.Values:
+			bodyReader = strings.NewReader(body.Encode())
+		case []byte:
+			bodyReader = bytes.NewBuffer(body)
+		case string:
+			bodyReader = strings.NewReader(body)
+		default:
+			return nil, newError(PostDataJsonMarshalException, fmt.Sprintf("Can't handle body type %T", rawContent))
+		}
+	}
+	return bodyReader, nil
+}
+
+func postWithClient(target, bodyType string, body interface{}, client *http.Client) (string, error) {
+	bodyReader, err := getBody(body)
+	if err != nil {
+		return "", err
 	}
 
-	a.Proxy = http.ProxyURL(proxiesUrl)
-	return a
+	request, err := http.NewRequest(POST, target, bodyReader)
+	setHeader("Content-Type", bodyType)
+	setHttpHeaderAndCookie(request)
+
+	if err != nil {
+		return "", newError(CreatePostRequestOjectException, "Can't create post request object : " + target)
+	}
+
+	response, err := client.Do(request)
+	if err != nil {
+		return "", newError(SendPostRequestException, "Can't send http post request" + target)
+	}
+
+	defer response.Body.Close()
+
+	content, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return "", newError(GetPostResponseContentException, "Cant' get http post response content : " +target)
+	}
+	return string(content), nil
+}
+
+func putWithClient(target, bodyType string, body interface{}, client *http.Client) (string, error) {
+	bodyReader, err := getBody(body)
+	if err != nil {
+		return "", err
+	}
+
+	request, err := http.NewRequest(PUT, target, bodyReader)
+	if err != nil {
+		return "", newError(CreatePutRequestObjectException, "Can't create put request object : " + target)
+	}
+
+	setHeader("Content-Type", bodyType)
+	setHttpHeaderAndCookie(request)
+
+	response, err := client.Do(request)
+	if err != nil {
+		return "", newError(GetPutResponseCotnentException, "Can't get put request response content : " + target)
+	}
+
+	defer response.Body.Close()
+
+	content, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return "", newError(ReaderPutResponseContentException, "Can't read put response content : " + target)
+	}
+	return string(content), nil
+}
+
+func Get(target string) (string, error) {
+	return getWithClient(target, defaultClient)
+}
+
+func Post(target, bodyType string, body interface{}) (string, error) {
+	return postWithClient(target, bodyType, body, defaultClient)
+}
+
+func PostForm(target string, data url.Values) (string, error) {
+	return postWithClient(target, "application/x-www-form-urlencoded", data, defaultClient)
+}
+
+func Put(target, bodyType string, body interface{}) (string, error) {
+	return putWithClient(target, bodyType, body, defaultClient)
 }
